@@ -18,10 +18,13 @@ Deletes **"Name left the group"** messages automatically. It can also delete **"
 
 ## 2. Put it on your server
 
-Upload the folder to your server, for example `/home/forge/tg-cleaner-bot`, then run:
+SSH into your server as `forge` and clone the repo into your home folder. (Uploading the folder by hand also works.)
+If the repo is private, use `git@github.com:Kimsoeurn/tg-cleaner-bot.git` instead; that needs the server's SSH key added to GitHub, for example as a deploy key on the repo.
 
 ```bash
-cd /home/forge/tg-cleaner-bot
+cd /home/forge
+git clone https://github.com/Kimsoeurn/tg-cleaner-bot.git
+cd tg-cleaner-bot
 cp .env.example .env
 nano .env            # paste your token into BOT_TOKEN=
 php bot.php          # test run
@@ -57,6 +60,10 @@ In Forge, open **your server → Daemons** (newer Forge versions may call this *
 Forge uses Supervisor, so the bot restarts by itself if it crashes or the server reboots. You can read its log from the same page.
 
 **After you change `.env`, restart the daemon** so it picks up the new settings.
+
+- **Don't create a Forge Site for this.** The bot isn't a website and needs no domain; a daemon is all it needs. (If someone does open `bot.php` in a browser, it just returns 404.)
+- **Wrong token?** The bot stops right away, and Supervisor may give up restarting it after a few tries. Fix `BOT_TOKEN` in `.env`, then press **Restart** on the daemon.
+- **To update the bot:** run `cd /home/forge/tg-cleaner-bot && git pull`, then restart the daemon.
 
 <details>
 <summary>Not using Forge? systemd example</summary>
@@ -103,14 +110,16 @@ Without this, anyone who finds your bot's username could add it to their own gro
 2. Put the ID in `.env`, for example `ALLOWED_CHAT_IDS=-1001234567890,-1009876543210`.
 3. Restart the daemon.
 
-If a normal group gets upgraded to a supergroup, its ID changes. The bot notices this and keeps working, and the log tells you the new ID to put in `.env`.
+**Adding another group later:** once `ALLOWED_CHAT_IDS` is set, the bot leaves a new group straight away, so `/chatid` won't answer there. Instead, find the line `"Group name" (-100…) is not in ALLOWED_CHAT_IDS, leaving it` in the daemon log, add that ID to `.env`, restart the daemon, and add the bot to the group again.
+
+If a normal group gets upgraded to a supergroup, its ID changes. The bot notices this and keeps working, and the log tells you the new ID to put in `.env`. If the daemon restarts before you do that, the bot won't leave the group, but it stops cleaning it and logs `Ignoring ... not in ALLOWED_CHAT_IDS` until you add the new ID.
 
 ---
 
 ## Good to know
 
 - **Groups with more than 50 members:** Telegram itself no longer posts "left the group" there, so there's nothing to delete. In those groups the bot is mainly useful with `DELETE_JOIN=true`.
-- **It only cleans new messages,** meaning ones that arrive while the bot is running. Delete old ones by hand.
+- **It doesn't clean old messages.** Telegram holds updates for up to 24 hours, so after a restart or short outage the bot catches up on what it missed. Anything older, delete by hand.
 - **Run only one copy** per token. If two run at once, the log shows `Conflict`.
 - **Privacy:** Telegram sends every group message to admin bots. This script ignores everything except join/leave messages and `/chatid`, and it never stores or logs message text. Everything stays on your server.
 
@@ -123,3 +132,4 @@ If a normal group gets upgraded to a supergroup, its ID changes. The bot notices
 | `Telegram rejected BOT_TOKEN` | Wrong token in `.env` |
 | `Conflict ...` | Two copies running, or the token has a webhook (from n8n). Use a separate bot |
 | `... is not in ALLOWED_CHAT_IDS, leaving it` | Someone added the bot to another group, so it left |
+| `Ignoring ... not in ALLOWED_CHAT_IDS` | The bot is in a group that isn't on the list (often your group's new supergroup ID). Add the ID to `.env` and restart |

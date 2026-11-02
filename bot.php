@@ -14,6 +14,11 @@
 
 declare(strict_types=1);
 
+if (PHP_SAPI !== 'cli') {
+    http_response_code(404); // command-line bot only; never run it from a web server
+    exit;
+}
+
 final class TelegramApi
 {
     public function __construct(private string $base, private string $token)
@@ -50,6 +55,8 @@ final class CleanerBot
 {
     private int $botId = 0;
     private string $botUsername = '';
+    /** @var array<int, true> Chats not in ALLOWED_CHAT_IDS that were already logged once. */
+    private array $ignoredChatIds = [];
 
     /** @param int[] $allowedChatIds Empty = work in any group. */
     public function __construct(
@@ -146,8 +153,15 @@ final class CleanerBot
         $this->followMigration($m, $chatId);
 
         if (!$this->isAllowed($chatId)) {
-            log_line("{$label} is not in ALLOWED_CHAT_IDS, leaving it.");
-            $this->api->call('leaveChat', ['chat_id' => $chatId]);
+            // Only leave when someone adds the bot. A group it is already in (for example one
+            // that became a supergroup while the bot was restarting) is ignored, never left.
+            if ($this->wasJustAdded($m)) {
+                log_line("{$label} is not in ALLOWED_CHAT_IDS, leaving it.");
+                $this->api->call('leaveChat', ['chat_id' => $chatId]);
+            } elseif (!isset($this->ignoredChatIds[$chatId])) {
+                $this->ignoredChatIds[$chatId] = true;
+                log_line("Ignoring {$label}: not in ALLOWED_CHAT_IDS. If it is your group, add {$chatId} to .env and restart.");
+            }
             return;
         }
 
@@ -231,6 +245,21 @@ final class CleanerBot
         return !$this->allowedChatIds || in_array($chatId, $this->allowedChatIds, true);
     }
 
+    /** True if this message is the bot being added to the chat (or the chat being created with it). */
+    private function wasJustAdded(array $m): bool
+    {
+        if (!empty($m['group_chat_created'])) {
+            return true;
+        }
+        foreach ($m['new_chat_members'] ?? [] as $user) {
+            if ((int) $user['id'] === $this->botId) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private function isChatIdCommand(string $text): bool
     {
         if (!preg_match('/^\/chatid(?:@(\w+))?$/i', trim($text), $match)) {
@@ -257,7 +286,13 @@ function load_config(string $file): array
                 continue;
             }
             [$key, $value] = explode('=', $line, 2);
-            $config[trim($key)] = trim(trim($value), "\"'");
+            $value = trim($value);
+            if (preg_match('/^(["\'])(.*?)\1/', $value, $quoted)) {
+                $value = $quoted[2];                                   // KEY="value"  # comment
+            } else {
+                $value = trim((string) preg_replace('/\s+#.*$/', '', $value), "\"'"); // KEY=value  # comment
+            }
+            $config[trim($key)] = $value;
         }
     }
     foreach (['BOT_TOKEN', 'DELETE_JOIN', 'ALLOWED_CHAT_IDS', 'TIMEZONE', 'TELEGRAM_API_BASE'] as $key) {
