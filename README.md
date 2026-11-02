@@ -2,8 +2,9 @@
 
 Deletes **"Name left the group"** messages automatically. It can also delete **"Name joined the group"** messages if you turn that on.
 
-- One PHP file, no Composer packages (PHP 8.0+ with `curl`, which every Forge server already has)
+- One PHP file, no Composer packages (PHP 8.0+ with `curl`, which every Forge server already has, plus SQLite for the audit log)
 - Uses long polling, so you don't need a domain, SSL certificate or webhook
+- Keeps an [audit log](#audit-log) of every message it deletes, if you want one
 - Runs on your own server, and it never saves or logs what people write
 
 ---
@@ -33,7 +34,7 @@ php bot.php          # test run
 You should see:
 
 ```
-[2026-11-02 10:19:24] Running as @niyum_cleaner_bot | deleting: left only | groups: any group where I am admin
+[2026-11-02 10:19:24] Running as @niyum_cleaner_bot | deleting: left only | groups: any group where I am admin | audit log: on
 ```
 
 Press `Ctrl+C` to stop the test run.
@@ -101,6 +102,8 @@ journalctl -u tg-cleaner-bot -f     # view log
 | `DELETE_JOIN` | `true` to also delete "joined the group" messages. Default `false` |
 | `ALLOWED_CHAT_IDS` | Optional. Only work in these groups, separated by commas. If set, the bot **leaves any other group** someone adds it to |
 | `TIMEZONE` | Timezone for log times. Default `Asia/Phnom_Penh` |
+| `AUDIT_LOG` | `true` to record every deleted message in `audit.sqlite` (see [Audit log](#audit-log)). Default `false`; `.env.example` turns it on |
+| `AUDIT_RETENTION_DAYS` | Remove audit records older than this many days. `0` or empty keeps them forever |
 
 ### Lock the bot to your groups (recommended)
 
@@ -116,12 +119,48 @@ If a normal group gets upgraded to a supergroup, its ID changes. The bot notices
 
 ---
 
+## Audit log
+
+With `AUDIT_LOG=true`, the bot writes a row to `audit.sqlite` (next to `bot.php`) every time it deletes a service message, or tries to and fails. If several people joined in one message, each gets a row.
+
+| Column | What it holds |
+|---|---|
+| `logged_at` | When the bot acted, in your `TIMEZONE`, e.g. `2026-11-02 10:19:24+07:00` |
+| `message_at` | When Telegram posted the message (earlier than `logged_at` if the bot was catching up after a restart) |
+| `chat_id`, `chat_title` | The group |
+| `message_id` | The deleted service message |
+| `kind` | `left` or `joined` |
+| `user_id`, `username`, `user_name` | The person who left or joined |
+| `deleted` | `1` if it was deleted, `0` if not |
+| `error` | Telegram's reason when `deleted` is `0` |
+
+Read it on the server with the `sqlite3` tool (`sudo apt install sqlite3` if it's missing). It's safe to do this while the bot is running. The last 20 entries:
+
+```bash
+cd /home/forge/tg-cleaner-bot && sqlite3 -header -column audit.sqlite "SELECT logged_at, chat_title, kind, user_id, username, user_name, deleted FROM deletions ORDER BY id DESC LIMIT 20"
+```
+
+Only the deletes that failed:
+
+```bash
+cd /home/forge/tg-cleaner-bot && sqlite3 -header -column audit.sqlite "SELECT logged_at, chat_title, kind, error FROM deletions WHERE deleted = 0 ORDER BY id DESC LIMIT 20"
+```
+
+Good to know:
+
+- **It contains personal data** (Telegram user IDs and names), so only the `forge` user can read the file. Set `AUDIT_RETENTION_DAYS` to keep only as much history as you need.
+- **`git pull` never touches it.** Git ignores `audit.sqlite`, so updating the bot keeps your history.
+- **You'll also see `audit.sqlite-wal` and `audit.sqlite-shm`.** SQLite needs them; leave them alone. To back up, run `sqlite3 audit.sqlite ".backup audit-backup.sqlite"` instead of copying the files.
+- **The stdout log keeps working as before.** The audit log is extra, and the bot keeps deleting even if a write to it fails.
+
+---
+
 ## Good to know
 
 - **Groups with more than 50 members:** Telegram itself no longer posts "left the group" there, so there's nothing to delete. In those groups the bot is mainly useful with `DELETE_JOIN=true`.
 - **It doesn't clean old messages.** Telegram holds updates for up to 24 hours, so after a restart or short outage the bot catches up on what it missed. Anything older, delete by hand.
 - **Run only one copy** per token. If two run at once, the log shows `Conflict`.
-- **Privacy:** Telegram sends every group message to admin bots. This script ignores everything except join/leave messages and `/chatid`, and it never stores or logs message text. Everything stays on your server.
+- **Privacy:** Telegram sends every group message to admin bots. This script ignores everything except join/leave messages and `/chatid`, and it never stores or logs message text. With `AUDIT_LOG=true` it stores who left or joined which group, and when. Everything stays on your server.
 
 ## Log messages
 
@@ -133,3 +172,6 @@ If a normal group gets upgraded to a supergroup, its ID changes. The bot notices
 | `Conflict ...` | Two copies running, or the token has a webhook (from n8n). Use a separate bot |
 | `... is not in ALLOWED_CHAT_IDS, leaving it` | Someone added the bot to another group, so it left |
 | `Ignoring ... not in ALLOWED_CHAT_IDS` | The bot is in a group that isn't on the list (often your group's new supergroup ID). Add the ID to `.env` and restart |
+| `AUDIT_LOG=true needs the PHP SQLite extension` | Run the `apt install` command it shows, or set `AUDIT_LOG=false` |
+| `Cannot open the audit log ...` | The `forge` user can't create or write `audit.sqlite`. Check the folder's owner |
+| `Could not write to the audit log ...` | One record was lost (for example, the disk is full). Deleting still works |
