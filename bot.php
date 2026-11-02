@@ -5,9 +5,11 @@
  * Deletes "Name left the group" service messages (and, if you turn it on,
  * "Name joined the group") in groups where this bot is an admin.
  *
- *  - One file, no Composer packages. Needs PHP 8.0+ with the curl extension.
+ *  - One file, no Composer packages. Needs PHP 8.0+ with the curl extension
+ *    (and pdo_sqlite if AUDIT_LOG=true).
  *  - Uses long polling: no domain, SSL certificate or open port needed.
- *  - Never stores or logs the text of anyone's messages.
+ *  - Never stores or logs the text of anyone's messages. With AUDIT_LOG=true it
+ *    records each deletion (who left/joined, where, when) in audit.sqlite.
  *
  * Run:  php bot.php      (settings are read from .env next to this file)
  */
@@ -51,6 +53,89 @@ final class TelegramApi
     }
 }
 
+/** Records every service message the bot deletes (or fails to delete) in an SQLite file. */
+final class AuditLog
+{
+    private PDO $db;
+    private int $prunedAt = 0;
+
+    /** @param int $retentionDays Records older than this are removed. 0 = keep forever. */
+    public function __construct(string $file, private int $retentionDays)
+    {
+        $this->db = new PDO("sqlite:{$file}", null, null, [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_TIMEOUT => 5, // wait instead of failing while someone reads the file
+        ]);
+        $this->db->exec('PRAGMA journal_mode = WAL');
+        $this->db->exec('CREATE TABLE IF NOT EXISTS deletions (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            logged_at  TEXT    NOT NULL, -- when the bot acted, e.g. 2026-11-02 10:19:24+07:00
+            message_at TEXT,             -- when Telegram posted the service message
+            chat_id    INTEGER NOT NULL,
+            chat_title TEXT,
+            message_id INTEGER NOT NULL,
+            kind       TEXT    NOT NULL, -- left | joined
+            user_id    INTEGER,          -- the person who left or joined
+            username   TEXT,
+            user_name  TEXT,
+            deleted    INTEGER NOT NULL, -- 1 = deleted, 0 = failed (see error)
+            error      TEXT
+        )');
+        $this->db->exec('CREATE INDEX IF NOT EXISTS deletions_chat ON deletions (chat_id, id)');
+        @chmod($file, 0600); // it holds user IDs and names, so only the bot's user may read it
+
+        $this->pruneIfDue();
+    }
+
+    /** Writes one row per person the service message was about. Never throws. */
+    public function record(array $m, string $kind, bool $deleted, ?string $error): void
+    {
+        $users = isset($m['left_chat_member']) ? [$m['left_chat_member']] : ($m['new_chat_members'] ?? []);
+
+        try {
+            $insert = $this->db->prepare('INSERT INTO deletions
+                (logged_at, message_at, chat_id, chat_title, message_id, kind, user_id, username, user_name, deleted, error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+            foreach ($users ?: [null] as $user) {
+                $insert->execute([
+                    date('Y-m-d H:i:sP'),
+                    isset($m['date']) ? date('Y-m-d H:i:sP', (int) $m['date']) : null,
+                    (int) $m['chat']['id'],
+                    $m['chat']['title'] ?? null,
+                    (int) $m['message_id'],
+                    $kind,
+                    isset($user['id']) ? (int) $user['id'] : null,
+                    $user['username'] ?? null,
+                    trim(($user['first_name'] ?? '') . ' ' . ($user['last_name'] ?? '')) ?: null,
+                    $deleted ? 1 : 0,
+                    $error,
+                ]);
+            }
+        } catch (PDOException $e) {
+            log_line('Could not write to the audit log: ' . $e->getMessage());
+        }
+    }
+
+    /** Removes expired records, at most once an hour. Never throws. */
+    public function pruneIfDue(): void
+    {
+        if ($this->retentionDays <= 0 || time() - $this->prunedAt < 3600) {
+            return;
+        }
+        $this->prunedAt = time();
+
+        try {
+            $delete = $this->db->prepare("DELETE FROM deletions WHERE CAST(strftime('%s', logged_at) AS INTEGER) < ?");
+            $delete->execute([time() - $this->retentionDays * 86400]);
+            if ($delete->rowCount() > 0) {
+                log_line("Removed {$delete->rowCount()} audit record(s) older than {$this->retentionDays} days.");
+            }
+        } catch (PDOException $e) {
+            log_line('Could not clean up the audit log: ' . $e->getMessage());
+        }
+    }
+}
+
 final class CleanerBot
 {
     private int $botId = 0;
@@ -63,6 +148,7 @@ final class CleanerBot
         private TelegramApi $api,
         private bool $deleteJoin,
         private array $allowedChatIds,
+        private ?AuditLog $audit = null,
     ) {
     }
 
@@ -71,14 +157,17 @@ final class CleanerBot
         $this->connect();
 
         log_line(sprintf(
-            'Running as @%s | deleting: %s | groups: %s',
+            'Running as @%s | deleting: %s | groups: %s | audit log: %s',
             $this->botUsername,
             $this->deleteJoin ? 'left + joined' : 'left only',
-            $this->allowedChatIds ? implode(', ', $this->allowedChatIds) : 'any group where I am admin'
+            $this->allowedChatIds ? implode(', ', $this->allowedChatIds) : 'any group where I am admin',
+            $this->audit ? 'on' : 'off'
         ));
 
         $offset = 0;
         while (true) {
+            $this->audit?->pruneIfDue();
+
             $res = $this->api->call('getUpdates', [
                 'offset'          => $offset,
                 'timeout'         => 50,          // long poll: Telegram holds the request until something happens
@@ -199,6 +288,7 @@ final class CleanerBot
             $res = $this->api->call('deleteMessage', $params);
             if ($res['ok'] ?? false) {
                 log_line("Deleted a '{$kind}' message in {$label}.");
+                $this->audit?->record($m, $kind, true, null);
                 return;
             }
             if ($attempt === 1 && ($res['error_code'] ?? 0) === 429) {
@@ -217,6 +307,7 @@ final class CleanerBot
             ? " -> Make the bot an admin with the 'Delete messages' permission."
             : '';
         log_line("Could not delete a '{$kind}' message in {$label}: {$desc}{$hint}");
+        $this->audit?->record($m, $kind, false, $desc);
     }
 
     /** When a basic group is upgraded to a supergroup its ID changes; keep it allowed. */
@@ -295,7 +386,7 @@ function load_config(string $file): array
             $config[trim($key)] = $value;
         }
     }
-    foreach (['BOT_TOKEN', 'DELETE_JOIN', 'ALLOWED_CHAT_IDS', 'TIMEZONE', 'TELEGRAM_API_BASE'] as $key) {
+    foreach (['BOT_TOKEN', 'DELETE_JOIN', 'ALLOWED_CHAT_IDS', 'TIMEZONE', 'TELEGRAM_API_BASE', 'AUDIT_LOG', 'AUDIT_RETENTION_DAYS'] as $key) {
         $env = getenv($key);
         if ($env !== false && $env !== '') {
             $config[$key] = $env;
@@ -329,8 +420,28 @@ if (($config['BOT_TOKEN'] ?? '') === '') {
     exit(1);
 }
 
+$audit = null;
+if (filter_var($config['AUDIT_LOG'] ?? 'false', FILTER_VALIDATE_BOOLEAN)) {
+    if (!extension_loaded('pdo_sqlite')) {
+        log_line(sprintf(
+            'AUDIT_LOG=true needs the PHP SQLite extension. Install it (sudo apt install php%d.%d-sqlite3) or set AUDIT_LOG=false.',
+            PHP_MAJOR_VERSION,
+            PHP_MINOR_VERSION
+        ));
+        exit(1);
+    }
+    $auditFile = __DIR__ . '/audit.sqlite';
+    try {
+        $audit = new AuditLog($auditFile, max(0, (int) ($config['AUDIT_RETENTION_DAYS'] ?? 0)));
+    } catch (PDOException $e) {
+        log_line("Cannot open the audit log {$auditFile}: {$e->getMessage()}");
+        exit(1);
+    }
+}
+
 (new CleanerBot(
     new TelegramApi($config['TELEGRAM_API_BASE'] ?? 'https://api.telegram.org', $config['BOT_TOKEN']),
     deleteJoin: filter_var($config['DELETE_JOIN'] ?? 'false', FILTER_VALIDATE_BOOLEAN),
     allowedChatIds: parse_ids($config['ALLOWED_CHAT_IDS'] ?? ''),
+    audit: $audit,
 ))->run();
